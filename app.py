@@ -58,7 +58,14 @@ def cf_expiry(url: str):
 
 
 def proxied(abs_url: str) -> str:
-    return "/proxy?u=" + quote(abs_url, safe="")
+    # Pehle fully decode karo (agar already encoded chars hain jaise %7E)
+    # Phir ek baar cleanly encode karo — double-encoding se bachne ke liye
+    from urllib.parse import unquote
+    try:
+        decoded = unquote(abs_url)
+    except Exception:
+        decoded = abs_url
+    return "/proxy?u=" + quote(decoded, safe="")
 
 
 def rewrite_playlist(text: str, base_url: str) -> str:
@@ -69,7 +76,13 @@ def rewrite_playlist(text: str, base_url: str) -> str:
     clean_base = urlunsplit((bp.scheme, bp.netloc, bp.path, "", ""))
 
     def fix(ref: str) -> str:
-        absu = urljoin(clean_base, ref.strip())
+        from urllib.parse import unquote
+        # Pehle ref decode karo (agar already encoded hai)
+        try:
+            ref_clean = unquote(ref.strip())
+        except Exception:
+            ref_clean = ref.strip()
+        absu = urljoin(clean_base, ref_clean)
         ap = urlsplit(absu)
         # query nahi hai aur host same hai -> parent ki auth query chipka do
         if not ap.query and auth_query and ap.netloc == bp.netloc:
@@ -157,9 +170,19 @@ def health():
 
 @app.route("/play")
 def play():
+    from urllib.parse import unquote
     v = request.args.get("v", "").strip()
     if not v:
         return error_page("URL missing", "Link me ?v=<video url> hona zaroori hai.", 400)
+    # Flask already ek baar decode karta hai — agar abhi bhi %25 jaise double-encoded
+    # chars hain to ek aur pass lagao taaki clean URL mile
+    try:
+        v_decoded = unquote(v)
+        # Sirf tab second decode karo jab pehle mein %25 (encoded %) tha
+        if "%25" in v or "%257E" in v or "%2526" in v:
+            v = v_decoded
+    except Exception:
+        pass
     if not is_safe_url(v):
         return error_page("Invalid URL", "Ye video URL allowed nahi hai.", 400)
 
