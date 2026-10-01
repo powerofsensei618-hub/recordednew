@@ -8,6 +8,7 @@ import time
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit, parse_qs
 
 import requests
+from http.cookiejar import DefaultCookiePolicy
 from flask import Flask, Response, abort, render_template_string, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -90,20 +91,50 @@ def rewrite_playlist(text: str, base_url: str) -> str:
     return "\n".join(out) + "\n"
 
 
-def upstream_get(u: str, stream=False, rng=None, timeout=(10, 30)):
+# 403 aaye to in header-sets ko baari baari try karte hain (jo chal jaye wo yaad rakhte hain)
+HEADER_SETS = [
+    {},  # sirf browser UA
+    {"Referer": "https://www.pw.live/", "Origin": "https://www.pw.live"},
+]
+_pref = [0]
+
+SESSION = requests.Session()
+SESSION.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))  # cookies store mat karo
+
+
+def _send(u: str, hdrs: dict, stream: bool, timeout):
+    prep = SESSION.prepare_request(requests.Request("GET", u, headers=hdrs))
+    prep.url = u  # URL byte-for-byte jaisa PW ne diya (%7E ko ~ me mat badlo)
+    return SESSION.send(prep, stream=stream, timeout=timeout, allow_redirects=True)
+
+
+def upstream_get(u: str, stream=False, rng=None, timeout=(10, 30), ua=None):
     # identity: gzip nahi, warna decoded body aur Content-Length mismatch ho jata hai
-    h = {"User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "identity"}
+    base = {"User-Agent": ua or UA, "Accept": "*/*", "Accept-Encoding": "identity"}
     if rng:
-        h["Range"] = rng
-    return requests.get(u, headers=h, stream=stream, timeout=timeout, allow_redirects=True)
+        base["Range"] = rng
+    order = [_pref[0]] + [i for i in range(len(HEADER_SETS)) if i != _pref[0]]
+    r = None
+    for i in order:
+        if r is not None:
+            r.close()
+        r = _send(u, {**base, **HEADER_SETS[i]}, stream, timeout)
+        if r.status_code != 403:
+            if r.status_code < 400:
+                _pref[0] = i
+            return r
+    return r
 
 
-def probe(u: str, timeout=(10, 30)):
+def probe(u: str, timeout=(10, 30), ua=None):
     """Ek URL ka status + (playlist ho to) shuru ki lines."""
     try:
-        r = upstream_get(u, timeout=timeout)
+        r = upstream_get(u, timeout=timeout, ua=ua)
         info = {"url": u.split("?")[0], "status": r.status_code,
                 "type": r.headers.get("Content-Type", ""), "bytes": len(r.content)}
+        for h in ("Server", "X-Cache", "X-Amz-Cf-Pop", "Via"):
+            if h in r.headers:
+                info[h.lower()] = r.headers[h][:80]
         if r.status_code >= 400 or r.content[:7] == b"#EXTM3U":
             info["head"] = r.text[:400]
         return info, r
@@ -122,7 +153,7 @@ PLAYER_HTML = """<!doctype html>
   html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,sans-serif}
   video{width:100%;height:100%;background:#000}
   #dbg{position:fixed;left:0;right:0;top:0;padding:4px 8px;font:11px monospace;
-       background:rgba(0,0,0,.6);color:#ff9;display:none;z-index:5;word-break:break-all}
+       background:rgba(0,0,0,.6);color:#ff9;display:none;z-index:5;word-break:break-all;white-space:pre-wrap}
   #msg{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
        text-align:center;padding:20px;font-size:18px;background:rgba(0,0,0,.85)}
 </style>
@@ -140,7 +171,8 @@ PLAYER_HTML = """<!doctype html>
   const msg = document.getElementById("msg");
   const dbg = document.getElementById("dbg");
   function fail(t){ msg.textContent = t; msg.style.display = "flex"; }
-  function note(t){ dbg.textContent = t; dbg.style.display = "block"; }
+  const LOG = [];
+  function note(t){ LOG.push(t); if (LOG.length > 5) LOG.shift(); dbg.textContent = LOG.join("\\n"); dbg.style.display = "block"; }
   video.addEventListener("error", () => note("video error: " + (video.error ? video.error.code + " " + (video.error.message||"") : "")));
 
   function loadScript(src, ok, bad){
@@ -183,7 +215,7 @@ PLAYER_HTML = """<!doctype html>
     let netRetry = 0;
     hls.on(Hls.Events.ERROR, (e, d) => {
       const code = d.response ? d.response.code : "";
-      note("[" + mode + "] " + (d.fatal ? "FATAL " : "") + d.type + " / " + d.details + (code !== "" ? " / HTTP " + code : "") + (PRE ? " | server-check: " + PRE : ""));
+      note("[" + mode + "] " + (d.fatal ? "FATAL " : "") + d.type + " / " + d.details + (code !== "" ? " / HTTP " + code : "") + (d.response && d.response.text ? " / " + String(d.response.text).replace(/\\s+/g, " ").slice(0, 80) : "") + (PRE && mode === "proxy" ? " | server-check: " + PRE : ""));
       if (!d.fatal) return;
       if (d.type === Hls.ErrorTypes.NETWORK_ERROR) {
         if (!useProxy && FORCE !== "direct") { hls.destroy(); startHls("proxy"); return; }
@@ -230,6 +262,15 @@ def error_page(title, text, code):
     return render_template_string(ERROR_HTML, title=title, text=text), code
 
 
+@app.after_request
+def add_cors(resp):
+    if request.path in ("/proxy", "/debug"):
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Range"
+        resp.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range"
+    return resp
+
+
 @app.route("/")
 def home():
     return "Recorded/Live player is running. Use /play?v=<encoded video url>"
@@ -259,10 +300,11 @@ def play():
     pre = ""
     if is_hls:
         # sirf info: server se master check. Fail ho to bhi player try karega (direct browser se)
-        info, _ = probe(v, timeout=(4, 6))
+        info, _ = probe(v, timeout=(4, 6), ua=request.headers.get("User-Agent"))
         st = info.get("status")
         if st != 200:
-            pre = "HTTP %s" % st
+            snip = re.sub(r"<[^>]+>|\s+", " ", info.get("head", "")).strip()[:90]
+            pre = ("HTTP %s %s" % (st, snip)).strip()
     return render_template_string(PLAYER_HTML, direct=v, proxy=proxied(v), is_hls=is_hls, pre=pre)
 
 
@@ -274,9 +316,18 @@ def debug():
     if not v or not is_safe_url(v):
         abort(400)
     steps = []
-    info, r = probe(v)
+    info, r = probe(v, ua=request.headers.get("User-Agent"))
     info["step"] = "master"
     info["expires_utc"] = cf_expiry(v)
+    tests = []
+    for i, hs in enumerate(HEADER_SETS):
+        try:
+            rr = _send(v, {"User-Agent": request.headers.get("User-Agent") or UA, "Accept": "*/*",
+                           "Accept-Encoding": "identity", **hs}, False, (5, 8))
+            tests.append({"set": i, "extra_headers": list(hs) or ["(none)"], "status": rr.status_code})
+        except requests.RequestException as e:
+            tests.append({"set": i, "error": str(e)[:100]})
+    info["header_tests"] = tests
     steps.append(info)
     try:
         if r is not None and r.status_code < 400 and r.text.lstrip().startswith("#EXTM3U"):
@@ -314,7 +365,8 @@ def proxy():
         abort(400)
 
     try:
-        r = upstream_get(u, stream=True, rng=request.headers.get("Range"))
+        r = upstream_get(u, stream=True, rng=request.headers.get("Range"),
+                         ua=request.headers.get("User-Agent"))
     except requests.RequestException:
         return Response("Upstream fetch failed", status=502, mimetype="text/plain")
 
