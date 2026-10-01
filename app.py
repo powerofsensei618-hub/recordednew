@@ -58,36 +58,25 @@ def cf_expiry(url: str):
 
 
 def proxied(abs_url: str) -> str:
-    # Pehle fully decode karo (agar already encoded chars hain jaise %7E)
-    # Phir ek baar cleanly encode karo — double-encoding se bachne ke liye
-    from urllib.parse import unquote
-    try:
-        decoded = unquote(abs_url)
-    except Exception:
-        decoded = abs_url
-    return "/proxy?u=" + quote(decoded, safe="")
+    return "/proxy?u=" + quote(abs_url, safe="")
+
+
+def abs_with_auth(ref: str, base_url: str) -> str:
+    """ref ko absolute banao; agar ref me query nahi hai aur host same hai to
+    parent ki CloudFront auth query (Signature/Policy/Key-Pair-Id) chipka do."""
+    bp = urlsplit(base_url)
+    clean_base = urlunsplit((bp.scheme, bp.netloc, bp.path, "", ""))
+    absu = urljoin(clean_base, ref.strip())
+    ap = urlsplit(absu)
+    if not ap.query and bp.query and ap.netloc == bp.netloc:
+        absu = urlunsplit((ap.scheme, ap.netloc, ap.path, bp.query, ""))
+    return absu
 
 
 def rewrite_playlist(text: str, base_url: str) -> str:
-    """Har URI ko absolute banao, CloudFront auth query (Signature/Policy/Key-Pair-Id)
-    aage ki sub-playlists/segments par bhi lagao, aur /proxy se route karo."""
-    bp = urlsplit(base_url)
-    auth_query = bp.query
-    clean_base = urlunsplit((bp.scheme, bp.netloc, bp.path, "", ""))
-
+    """Har URI ko absolute banao, auth query aage bhi lagao, aur /proxy se route karo."""
     def fix(ref: str) -> str:
-        from urllib.parse import unquote
-        # Pehle ref decode karo (agar already encoded hai)
-        try:
-            ref_clean = unquote(ref.strip())
-        except Exception:
-            ref_clean = ref.strip()
-        absu = urljoin(clean_base, ref_clean)
-        ap = urlsplit(absu)
-        # query nahi hai aur host same hai -> parent ki auth query chipka do
-        if not ap.query and auth_query and ap.netloc == bp.netloc:
-            absu = urlunsplit((ap.scheme, ap.netloc, ap.path, auth_query, ""))
-        return proxied(absu)
+        return proxied(abs_with_auth(ref, base_url))
 
     out = []
     for line in text.splitlines():
@@ -101,6 +90,27 @@ def rewrite_playlist(text: str, base_url: str) -> str:
     return "\n".join(out) + "\n"
 
 
+def upstream_get(u: str, stream=False, rng=None, timeout=(10, 30)):
+    # identity: gzip nahi, warna decoded body aur Content-Length mismatch ho jata hai
+    h = {"User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "identity"}
+    if rng:
+        h["Range"] = rng
+    return requests.get(u, headers=h, stream=stream, timeout=timeout, allow_redirects=True)
+
+
+def probe(u: str, timeout=(10, 30)):
+    """Ek URL ka status + (playlist ho to) shuru ki lines."""
+    try:
+        r = upstream_get(u, timeout=timeout)
+        info = {"url": u.split("?")[0], "status": r.status_code,
+                "type": r.headers.get("Content-Type", ""), "bytes": len(r.content)}
+        if r.status_code >= 400 or r.content[:7] == b"#EXTM3U":
+            info["head"] = r.text[:400]
+        return info, r
+    except requests.RequestException as e:
+        return {"url": u.split("?")[0], "status": "ERR", "error": str(e)[:200]}, None
+
+
 # ---------------------------------------------------------------- pages
 PLAYER_HTML = """<!doctype html>
 <html lang="hi">
@@ -111,38 +121,100 @@ PLAYER_HTML = """<!doctype html>
 <style>
   html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,sans-serif}
   video{width:100%;height:100%;background:#000}
+  #dbg{position:fixed;left:0;right:0;top:0;padding:4px 8px;font:11px monospace;
+       background:rgba(0,0,0,.6);color:#ff9;display:none;z-index:5;word-break:break-all}
   #msg{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
        text-align:center;padding:20px;font-size:18px;background:rgba(0,0,0,.85)}
 </style>
 </head>
 <body>
 <video id="v" controls autoplay playsinline></video>
+<div id="dbg"></div>
 <div id="msg"></div>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
 <script>
-  const SRC = {{ src|tojson }};
+  const DIRECT = {{ direct|tojson }};   // original CloudFront/media URL
+  const PROXY = {{ proxy|tojson }};     // apne server ka /proxy URL
   const IS_HLS = {{ is_hls|tojson }};
+  const PRE = {{ pre|tojson }};         // server-side check ka status (info)
   const video = document.getElementById("v");
   const msg = document.getElementById("msg");
+  const dbg = document.getElementById("dbg");
   function fail(t){ msg.textContent = t; msg.style.display = "flex"; }
+  function note(t){ dbg.textContent = t; dbg.style.display = "block"; }
+  video.addEventListener("error", () => note("video error: " + (video.error ? video.error.code + " " + (video.error.message||"") : "")));
 
-  if (!IS_HLS) {
-    video.src = SRC;
-  } else if (window.Hls && Hls.isSupported()) {
-    const hls = new Hls({ enableWorker: true, lowLatencyMode: false });
-    hls.loadSource(SRC);
+  function loadScript(src, ok, bad){
+    const s = document.createElement("script");
+    s.src = src; s.onload = ok; s.onerror = bad;
+    document.head.appendChild(s);
+  }
+
+  // ?mode=direct | proxy se force kar sakte ho (default: pehle direct, fail ho to proxy)
+  const FORCE = new URLSearchParams(location.search).get("mode");
+
+  function startHls(mode) {
+    const useProxy = mode === "proxy";
+    const src = useProxy ? PROXY : DIRECT;
+    const hlsCfg = { enableWorker: true, lowLatencyMode: false };
+
+    if (!useProxy) {
+      // direct mode: master URL ki auth query (Signature/Policy/Key-Pair-Id) har
+      // sub-playlist / segment request par bhi lagao (CloudFront policy "/*" ke liye zaroori)
+      const M = new URL(DIRECT);
+      const AUTH = M.search.slice(1);
+      const Base = Hls.DefaultConfig.loader;
+      class AuthLoader extends Base {
+        load(ctx, cfg, cb) {
+          try {
+            const u = new URL(ctx.url);
+            if (u.host === M.host && !/[?&](Signature|Policy|Expires)=/.test(u.search)) {
+              ctx.url = ctx.url + (ctx.url.indexOf("?") > -1 ? "&" : "?") + AUTH;
+            }
+          } catch (e) {}
+          super.load(ctx, cfg, cb);
+        }
+      }
+      hlsCfg.loader = AuthLoader;
+    }
+
+    const hls = new Hls(hlsCfg);
+    hls.loadSource(src);
     hls.attachMedia(video);
     let netRetry = 0;
     hls.on(Hls.Events.ERROR, (e, d) => {
+      const code = d.response ? d.response.code : "";
+      note("[" + mode + "] " + (d.fatal ? "FATAL " : "") + d.type + " / " + d.details + (code !== "" ? " / HTTP " + code : "") + (PRE ? " | server-check: " + PRE : ""));
       if (!d.fatal) return;
-      if (d.type === Hls.ErrorTypes.NETWORK_ERROR && netRetry < 3) { netRetry++; hls.startLoad(); }
-      else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) { hls.recoverMediaError(); }
-      else { hls.destroy(); fail("Video load nahi ho paya. Link expire ho gaya ho sakta hai - naya link generate karo."); }
+      if (d.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        if (!useProxy && FORCE !== "direct") { hls.destroy(); startHls("proxy"); return; }
+        if (netRetry < 3) { netRetry++; hls.startLoad(); return; }
+      } else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        hls.recoverMediaError(); return;
+      }
+      hls.destroy();
+      fail("Video load nahi ho paya (" + d.details + (code !== "" ? ", HTTP " + code : "") + "). Link expire/invalid ho sakta hai - naya link generate karo.");
     });
-  } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-    video.src = SRC;
+  }
+
+  function start() {
+    if (!IS_HLS) {
+      video.src = DIRECT;
+    } else if (window.Hls && Hls.isSupported()) {
+      startHls(FORCE === "proxy" ? "proxy" : "direct");
+    } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+      video.src = PROXY;
+    } else {
+      fail("Is browser me HLS support nahi hai.");
+    }
+  }
+
+  if (!IS_HLS) {
+    start();
   } else {
-    fail("Is browser me HLS support nahi hai.");
+    // pehle apne server ki copy (/static/hls.min.js), na mile to CDN fallback
+    loadScript("/static/hls.min.js", start, function () {
+      loadScript("https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js", start, start);
+    });
   }
 </script>
 </body>
@@ -170,19 +242,9 @@ def health():
 
 @app.route("/play")
 def play():
-    from urllib.parse import unquote
     v = request.args.get("v", "").strip()
     if not v:
         return error_page("URL missing", "Link me ?v=<video url> hona zaroori hai.", 400)
-    # Flask already ek baar decode karta hai — agar abhi bhi %25 jaise double-encoded
-    # chars hain to ek aur pass lagao taaki clean URL mile
-    try:
-        v_decoded = unquote(v)
-        # Sirf tab second decode karo jab pehle mein %25 (encoded %) tha
-        if "%25" in v or "%257E" in v or "%2526" in v:
-            v = v_decoded
-    except Exception:
-        pass
     if not is_safe_url(v):
         return error_page("Invalid URL", "Ye video URL allowed nahi hai.", 400)
 
@@ -193,8 +255,56 @@ def play():
 
     path = urlsplit(v).path.lower()
     is_hls = path.endswith(".m3u8") or ".m3u8" in path
-    src = proxied(v) if is_hls else v
-    return render_template_string(PLAYER_HTML, src=src, is_hls=is_hls)
+
+    pre = ""
+    if is_hls:
+        # sirf info: server se master check. Fail ho to bhi player try karega (direct browser se)
+        info, _ = probe(v, timeout=(4, 6))
+        st = info.get("status")
+        if st != 200:
+            pre = "HTTP %s" % st
+    return render_template_string(PLAYER_HTML, direct=v, proxy=proxied(v), is_hls=is_hls, pre=pre)
+
+
+
+@app.route("/debug")
+def debug():
+    """/debug?v=<encoded master url> -> poori chain ka status JSON (master, sub-playlist, key, segment)."""
+    v = request.args.get("v", "").strip()
+    if not v or not is_safe_url(v):
+        abort(400)
+    steps = []
+    info, r = probe(v)
+    info["step"] = "master"
+    info["expires_utc"] = cf_expiry(v)
+    steps.append(info)
+    try:
+        if r is not None and r.status_code < 400 and r.text.lstrip().startswith("#EXTM3U"):
+            lines = [l.strip() for l in r.text.splitlines() if l.strip()]
+            subs = [l for l in lines if not l.startswith("#")]
+            if subs:
+                sub_url = abs_with_auth(subs[0], r.url)
+                info2, r2 = probe(sub_url)
+                info2["step"] = "sub-playlist"
+                steps.append(info2)
+                if r2 is not None and r2.status_code < 400:
+                    l2 = [l.strip() for l in r2.text.splitlines() if l.strip()]
+                    for l in l2:
+                        m = URI_ATTR.search(l)
+                        if l.startswith("#EXT-X-KEY") and m:
+                            i3, _ = probe(abs_with_auth(m.group(1), r2.url))
+                            i3["step"] = "key"
+                            i3.pop("head", None) if i3.get("status") == 200 else None
+                            steps.append(i3)
+                            break
+                    segs = [l for l in l2 if not l.startswith("#")]
+                    if segs:
+                        i4, _ = probe(abs_with_auth(segs[0], r2.url))
+                        i4["step"] = "first-segment"
+                        steps.append(i4)
+    except Exception as e:
+        steps.append({"step": "debug-error", "error": str(e)[:200]})
+    return Response(json.dumps(steps, indent=2), mimetype="application/json")
 
 
 @app.route("/proxy")
@@ -203,12 +313,8 @@ def proxy():
     if not u or not is_safe_url(u):
         abort(400)
 
-    headers = {"User-Agent": UA, "Accept": "*/*"}
-    if "Range" in request.headers:
-        headers["Range"] = request.headers["Range"]
-
     try:
-        r = requests.get(u, headers=headers, stream=True, timeout=(10, 30), allow_redirects=True)
+        r = upstream_get(u, stream=True, rng=request.headers.get("Range"))
     except requests.RequestException:
         return Response("Upstream fetch failed", status=502, mimetype="text/plain")
 
